@@ -20,6 +20,8 @@ import multiprocessing as mp
 from regions import RectanglePixelRegion
 from regions import Regions
 from regions import CircleSkyRegion
+import emcee
+from lmfit import Parameter
 #class for fitting
 
 '''
@@ -46,6 +48,9 @@ class SED_fitting(object):
         kappa0=0.1773 #converted to m^2/kg #reference dust oppacity in cm^2 g^-1 ***need to choose better value***
         nu0=600e9      #reference frequency for reference dust opacity (Hz)
 
+        self.init_T=init_T
+        self.init_N=init_N
+        self.init_beta=init_beta
         import lmfit
         variables=[init_T, init_beta, init_N,mH,mu,chi_d,kappa0,nu0]
         names=['T','beta','N','mH','mu','chi_d','kappa0','nu0']
@@ -81,7 +86,16 @@ class SED_fitting(object):
         self.df=df #data frame containing the files,paths,colors,labels and whether or not to fit.
 
     
-    def fit_mod_blackbody(self,region_file=None,fluxes=None,frequencies=None,yerr=None,method='lm'): 
+    def fit_mod_blackbody(self,method,region_file=None,fluxes=None,frequencies=None,yerr=None):
+        if method=='chi2':
+            self.fit_mod_blackbody_chi(region_file,fluxes,frequencies,yerr,method='lm')
+        elif method=='MCMC':
+            self.fit_mod_blackbody_MCMC(region_file,fluxes,frequencies,yerr)
+        elif method=='UltraNest':
+            self.fit_mod_blackbody_UN(region_file,fluxes,frequencies,yerr)
+
+    
+    def fit_mod_blackbody_chi(self,region_file=None,fluxes=None,frequencies=None,yerr=None,method='lm'): 
         import lmfit
         #fit modified blackbody to a single pixel, i.e a 1D array of fluxes and frequencies.
         #make self.vals/self.errors attributes with T,NH,Beta values and errors to be returned.
@@ -94,8 +108,8 @@ class SED_fitting(object):
             self.calculate(region_file)
             fluxes=self.df.loc[self.df['fit?'] == True, 'fluxes']
             frequencies=self.df.loc[self.df['fit?'] == True, 'frequencies']
-            #yerr=self.df.loc[self.df['fit?'] == True, 'yerr']
-            yerr=fluxes*0.1
+            yerr=self.df.loc[self.df['fit?'] == True, 'yerr']
+            #yerr=fluxes*0.1
         #print(fluxes)
         parameters=self.parameters
         to_fit=self.other_mod_blackbody
@@ -108,6 +122,40 @@ class SED_fitting(object):
         self.parameters['T']=lm.params['T']
         self.parameters['beta']=lm.params['beta']
         self.parameters['N']=lm.params['N']
+        return self.vals,self.errors
+    
+    def fit_mod_blackbody_MCMC(self,region_file=None,fluxes=None,frequencies=None,yerr=None):
+        if fluxes is not None:
+            self.df['frequencies']=frequencies
+            self.df['fluxes']=fluxes
+            self.df['yerr']=yerr
+        if fluxes is None:
+            self.calculate(region_file)
+            fluxes=self.df.loc[self.df['fit?'] == True, 'fluxes']
+            frequencies=self.df.loc[self.df['fit?'] == True, 'frequencies']
+            yerr=self.df.loc[self.df['fit?'] == True, 'yerr']
+
+        solnx=np.array([self.init_T,np.log10(self.init_N),self.init_beta])
+        pos = solnx +  1.0e-3 * np.random.randn(70,3)
+        nwalkers, ndim = pos.shape
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_probability_uniform, args=(self.df['frequencies'], self.df['fluxes'], self.df['yerr']) )
+        sampler.run_mcmc(pos, 10000, progress=True);    
+        flat_samples = sampler.get_chain(discard=1000, thin=15, flat=True)
+        T = np.percentile(flat_samples[:, 0], [16, 50, 84])
+        logN = np.percentile(flat_samples[:, 1], [16, 50, 84])
+        beta = np.percentile(flat_samples[:, 2], [16, 50, 84])
+        print(T,logN,beta)
+
+        self.parameters['T']=Parameter(name='T',value=T[1])
+        self.parameters['beta']=Parameter(name='beta',value=beta[1])
+        self.parameters['N']=Parameter(name='N',value=logN[1])
+
+        self.vals=T[1],logN[1],beta[1]
+        self.errors_lo=T[0],logN[0],beta[0]
+        self.errors_hi=T[2],logN[2],beta[2]
+        return self.vals,self.errors_lo,self.errors_hi
+    
+    def fit_mod_blackbody_UN(self,region_file=None,fluxes=None,frequencies=None,yerr=None):
         return self.vals,self.errors
     
     def calculate(self,region_file):
@@ -432,6 +480,46 @@ class SED_fitting(object):
         self.mask=mask
         return
     
+##### EMCEE functions
+
+def mod_bb_emcee(nu,T,N,beta):
+        h=const.h.value
+        c=const.c.value
+        k_B=const.k_B.value
+        tau=optical_depth_emcee(nu,N,beta)
+        B_nu=((2.*h)*(nu**3.) / (c**2.)) / (np.exp((h*nu) / (k_B*T))-1.0)
+        mod_bb=B_nu*(1.0-np.exp(-1.0*tau))*(10.0**26) 
+        return mod_bb
+
+def optical_depth_emcee(nu,N,beta):
+        m_H=1.6735575e-27 #Hydrogen mass in Kg
+        mu=2.8     #mean molecular weight of hydrogen.
+        chi_d=100  #gas to dust mass ratio
+        kappa0=0.1773 #converted to m^2/kg #reference dust oppacity in cm^2 g^-1 ***need to choose better value***
+        nu0=600e9      #reference frequency for reference dust opacity (Hz)
+        kappa_nu=(kappa0/chi_d)*((nu/nu0)**beta)
+        tau=mu*m_H*kappa_nu*N
+        return tau
+
+def log_likelihood(theta, freq, flux, yerr):
+    T, logN, beta = theta
+    N=np.power(10,logN)
+    model = mod_bb_emcee(freq, T, N, beta)
+    sigma2 = yerr ** 2 + model ** 2 
+    return -0.5 * np.sum((flux - model) ** 2 / sigma2 + np.log(sigma2))
+
+def log_prior_uniform(theta):
+    T, logN, beta = theta
+    prior = 0.0
+    if 2.73 < T < 1000 and 10 < logN < 40 and 0.0 < beta < 5.0:
+        return prior
+    return -np.inf
+
+def log_probability_uniform(theta, x, y, yerr):
+    lp = log_prior_uniform(theta)
+    if not np.isfinite(lp):
+        return -np.inf
+    return lp + log_likelihood(theta, x, y, yerr)
 
 
 def calculate_intensity(fitsfile,region_file):
@@ -449,14 +537,7 @@ def calculate_intensity(fitsfile,region_file):
             try:
                 restfreq=head['RESTFREQ']
             except:
-                if fitsfile.startswith('../SgrB2_M_data/ag_band6/sgr_b2m.M.B6.allspw.continuum.r0.5.clean1000.image.tt0.pbcor.fits'):
-                    restfreq=225.84e9
-                elif fitsfile.startswith('../all_data/VLA/abcd_006') or fitsfile.startswith('../SgrB2_N_data/vla/abcd_006'):
-                    restfreq=6e9
-                elif fitsfile.startswith('../all_data/VLA/abcd_010') or fitsfile.startswith('../SgrB2_N_data/vla/abcd_010'):
-                    restfreq=10e9
-                else:
-                    restfreq=92.45e9
+                raise Exception("No frequency information found in header for KEYS: RESTFREQ/RESTFRQ")
         #print('Freq',restfreq)
         restfreq=(restfreq*u.Hz)
         my_beam = Beam.from_fits_header(head)
@@ -525,14 +606,7 @@ def pixel_intensity(fitsfile,x,y):
                 try:
                     restfreq=head['RESTFREQ']
                 except:
-                    if fitsfile.startswith('../SgrB2_M_data/ag_band6/sgr_b2m.M.B6.allspw.continuum'):
-                        restfreq=225.84e9
-                    elif fitsfile.startswith('../all_data/VLA/abcd_006') or fitsfile.startswith('../SgrB2_N_data/vla/abcd_006'):
-                        restfreq=6e9
-                    elif fitsfile.startswith('../all_data/VLA/abcd_010') or fitsfile.startswith('../SgrB2_N_data/vla/abcd_010'):
-                        restfreq=10e9
-                    else:
-                        restfreq=92.45e9
+                    raise Exception("No frequency information found in header for KEYS: RESTFREQ/RESTFRQ")
             restfreq=(restfreq*u.Hz)
             my_beam = Beam.from_fits_header(head)
             avg_intensity=image_data[y,x] #stupid fucking coordinates
